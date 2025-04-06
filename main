@@ -1,0 +1,214 @@
+#!/bin/bash
+
+# Auto-upload script for GitHub repositories
+# Version: 1.0.0
+# Author: Shan
+# Date: April 07, 2025
+
+# Configuration
+readonly DEFAULT_REPO_PATH="$HOME/repos"
+readonly DEFAULT_BRANCH="main"
+readonly LOG_FILE="auto_upload_$(date '+%Y%m%d_%H%M%S').log"
+readonly REQUIRED_COMMANDS=(git curl)
+
+# Colors for output
+readonly RED='\033[0;31m'
+readonly GREEN='\033[0;32m'
+readonly NC='\033[0m' # No Color
+
+# Logging function
+log_message() {
+    local level="$1"
+    local message="$2"
+    echo "$(date '+%Y-%m-%d %H:%M:%S') [$level] - $message" >> "$LOG_FILE"
+}
+
+# Print error and exit
+error_exit() {
+    echo -e "${RED}ERROR:${NC} $1" >&2
+    log_message "ERROR" "$1"
+    exit 1
+}
+
+# Print success message
+success_message() {
+    echo -e "${GREEN}SUCCESS:${NC} $1"
+    log_message "INFO" "$1"
+}
+
+# Check and install dependencies
+check_dependencies() {
+    for cmd in "${REQUIRED_COMMANDS[@]}"; do
+        if ! command -v "$cmd" &> /dev/null; then
+            echo "Installing $cmd..."
+            log_message "INFO" "Installing $cmd"
+            sudo apt-get update && sudo apt-get install "$cmd" -y || {
+                error_exit "Failed to install $cmd. Please install it manually."
+            }
+            log_message "INFO" "Successfully installed $cmd"
+        fi
+    done
+}
+
+# Validate Git repository
+validate_git_repo() {
+    local path="$1"
+    [ -d "$path/.git" ] || return 1
+}
+
+# Create GitHub repository if it doesn't exist
+create_github_repo() {
+    local username="$1"
+    local token="$2"
+    local repo_name="$3"
+    local description="$4"
+    local private="$5"
+
+    local response=$(curl -s -u "$username:$token" "https://api.github.com/repos/$username/$repo_name")
+    if echo "$response" | grep -q "Not Found"; then
+        echo "Creating repository $repo_name on GitHub..."
+        local create_response=$(curl -s -u "$username:$token" -X POST "https://api.github.com/user/repos" \
+            -d "{\"name\":\"$repo_name\",\"description\":\"$description\",\"private\":$private}")
+        echo "$create_response" | grep -q "created_at" || {
+            error_exit "Failed to create repository. Check your token permissions (needs 'repo' scope)."
+        }
+        log_message "INFO" "Created repository: $repo_name"
+    else
+        log_message "INFO" "Repository $repo_name already exists on GitHub"
+    fi
+}
+
+# Main script
+main() {
+    # Initialize logging
+    touch "$LOG_FILE" || error_exit "Failed to create log file at $LOG_FILE"
+    log_message "INFO" "Script started"
+
+    # Check dependencies
+    check_dependencies
+
+    # Prompt for GitHub credentials
+    echo "=== GitHub Authentication ==="
+    read -p "GitHub Username: " GH_USERNAME
+    [ -z "$GH_USERNAME" ] && error_exit "Username cannot be empty"
+    read -s -p "GitHub Personal Access Token: " GH_TOKEN
+    echo
+    [ -z "$GH_TOKEN" ] && error_exit "Personal Access Token cannot be empty"
+
+    # Prompt for repository details
+    echo -e "\n=== Repository Details ==="
+    read -p "Repository Name: " REPO_NAME
+    [ -z "$REPO_NAME" ] && error_exit "Repository name cannot be empty"
+    read -p "Repository Description (optional): " REPO_DESCRIPTION
+    local VISIBILITY VISIBILITY_JSON
+    while true; do
+        echo "Repository Visibility:"
+        echo "  1) Public"
+        echo "  2) Private"
+        read -p "Choose option (1/2): " VISIBILITY_OPTION
+        case "$VISIBILITY_OPTION" in
+            1) VISIBILITY="public"; VISIBILITY_JSON="false"; break;;
+            2) VISIBILITY="private"; VISIBILITY_JSON="true"; break;;
+            *) echo "Invalid option. Please choose 1 or 2.";;
+        esac
+    done
+
+    # Create repository on GitHub
+    create_github_repo "$GH_USERNAME" "$GH_TOKEN" "$REPO_NAME" "$REPO_DESCRIPTION" "$VISIBILITY_JSON"
+    local REPO_URL="https://github.com/$GH_USERNAME/$REPO_NAME.git"
+    local AUTH_URL="https://$GH_USERNAME:$GH_TOKEN@github.com/$GH_USERNAME/$REPO_NAME.git"
+
+    # Prompt for local repository path
+    echo -e "\n=== Local Repository Setup ==="
+    read -p "Local Repository Path (default: $DEFAULT_REPO_PATH/$REPO_NAME): " REPO_PATH
+    REPO_PATH="${REPO_PATH:-$DEFAULT_REPO_PATH/$REPO_NAME}"
+
+    # Set up local repository
+    if [ ! -d "$REPO_PATH" ]; then
+        mkdir -p "$REPO_PATH" || error_exit "Failed to create directory: $REPO_PATH"
+        cd "$REPO_PATH" || error_exit "Failed to change to directory: $REPO_PATH"
+        git init || error_exit "Failed to initialize Git repository"
+        log_message "INFO" "Initialized new Git repository at $REPO_PATH"
+    else
+        cd "$REPO_PATH" || error_exit "Failed to change to directory: $REPO_PATH"
+        if ! validate_git_repo "$REPO_PATH"; then
+            git init || error_exit "Failed to initialize Git repository"
+            log_message "INFO" "Initialized existing directory as Git repository at $REPO_PATH"
+        fi
+    fi
+
+    # Configure Git remote
+    git remote remove origin 2>/dev/null || true
+    git remote add origin "$AUTH_URL" || error_exit "Failed to set Git remote"
+
+    # Prompt for README
+    read -p "Add a README.md file? (y/n): " ADD_README
+    if [[ "$ADD_README" =~ ^[Yy]$ ]]; then
+        cat > README.md << EOF
+# $REPO_NAME
+
+## Description
+$REPO_DESCRIPTION
+
+## Visibility
+This repository is $VISIBILITY.
+EOF
+        ${EDITOR:-nano} README.md
+        log_message "INFO" "Created and edited README.md"
+    fi
+
+    # Prompt for commit details
+    echo -e "\n=== Commit Details ==="
+    read -p "Commit Message (default: 'Initial commit'): " COMMIT_MESSAGE
+    COMMIT_MESSAGE="${COMMIT_MESSAGE:-Initial commit}"
+    read -p "Branch Name (default: $DEFAULT_BRANCH): " BRANCH
+    BRANCH="${BRANCH:-$DEFAULT_BRANCH}"
+
+    # File selection
+    echo "File Selection:"
+    echo "  1) Add all files"
+    echo "  2) Add specific files"
+    while true; do
+        read -p "Choose option (1/2): " FILE_OPTION
+        case "$FILE_OPTION" in
+            1)
+                git add . || error_exit "Failed to stage all files"
+                log_message "INFO" "Staged all files"
+                break
+                ;;
+            2)
+                read -p "Enter file paths (space-separated): " FILES
+                [ -z "$FILES" ] && error_exit "No files specified"
+                for file in $FILES; do
+                    [ -f "$file" ] || error_exit "File not found: $file"
+                    git add "$file" || error_exit "Failed to stage $file"
+                done
+                log_message "INFO" "Staged files: $FILES"
+                break
+                ;;
+            *) echo "Invalid option. Please choose 1 or 2.";;
+        esac
+    done
+
+    # Commit changes
+    if git diff --staged --quiet; then
+        echo "No changes to commit."
+        log_message "WARNING" "No changes to commit"
+        exit 0
+    fi
+    git commit -m "$COMMIT_MESSAGE" || error_exit "Failed to commit changes"
+    log_message "INFO" "Committed changes with message: $COMMIT_MESSAGE"
+
+    # Push to GitHub
+    git push origin "$BRANCH" || error_exit "Failed to push to branch $BRANCH. Check credentials and network."
+    success_message "Successfully pushed changes to $BRANCH at $REPO_URL"
+
+    # Clean up remote URL (remove token)
+    git remote set-url origin "$REPO_URL" || error_exit "Failed to clean up remote URL"
+    log_message "INFO" "Cleaned up remote URL"
+    log_message "INFO" "Script completed successfully"
+}
+
+# Trap errors and clean up
+trap 'error_exit "Script terminated unexpectedly"' ERR
+main
